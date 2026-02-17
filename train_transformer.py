@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from mahjong_ai.training.ppo_trainer import PPOConfig, PPOTrainer
@@ -32,12 +33,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-mode", type=str, default="online", choices=["online", "offline", "disabled"])
     parser.add_argument("--wandb-tags", type=str, default="")
+    parser.add_argument("--ddp-backend", type=str, default="", choices=["", "nccl", "gloo"])
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
     tags = tuple(tag.strip() for tag in args.wandb_tags.split(",") if tag.strip())
+    rank = int(os.environ.get("RANK", "0"))
+    is_main = rank == 0
     cfg = PPOConfig(
         total_steps=args.total_steps,
         rollout_steps=args.rollout_steps,
@@ -56,6 +60,7 @@ def main() -> None:
         wandb_run_name=args.wandb_run_name,
         wandb_mode=args.wandb_mode,
         wandb_tags=tags,
+        ddp_backend=args.ddp_backend,
         model_d_model=args.d_model,
         model_num_heads=args.num_heads,
         model_num_layers=args.num_layers,
@@ -64,7 +69,7 @@ def main() -> None:
     )
     trainer = PPOTrainer(config=cfg)
     logs = trainer.train()
-    if logs:
+    if logs and is_main:
         last = logs[-1]
         print("training finished")
         print(
@@ -72,7 +77,8 @@ def main() -> None:
             f"loss={last['loss']:.4f} policy={last['policy_loss']:.4f} value={last['value_loss']:.4f}"
         )
     latest_ckpt = Path(cfg.checkpoint_dir) / "ppo_latest.pt"
-    print(f"latest checkpoint: {latest_ckpt}")
+    if is_main:
+        print(f"latest checkpoint: {latest_ckpt}")
 
 
 if __name__ == "__main__":

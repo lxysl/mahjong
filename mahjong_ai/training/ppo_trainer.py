@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import os
 from pathlib import Path
 import time
 from typing import Any
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch import nn
 from torch.distributions import Categorical
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from mahjong_ai.agent.network import TransformerConfig, TransformerPolicyValueNet
 from mahjong_ai.agent.observation_encoder import ObservationEncoder
@@ -44,6 +47,8 @@ class PPOConfig:
     wandb_mode: str = "online"
     wandb_tags: tuple[str, ...] = ()
 
+    ddp_backend: str = ""
+
     model_d_model: int = 256
     model_num_heads: int = 8
     model_num_layers: int = 16
@@ -61,7 +66,12 @@ class PPOTrainer:
         model: TransformerPolicyValueNet | None = None,
     ) -> None:
         self.config = config or PPOConfig()
-        self.device = self._resolve_device(self.config.device)
+        self.rank = int(os.environ.get("RANK", "0"))
+        self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self.is_distributed = self.world_size > 1
+        self.device = self._resolve_device(self.config.device, self.local_rank, self.is_distributed)
+        self._init_distributed_if_needed()
         self.encoder = encoder or ObservationEncoder()
         self.model = model or TransformerPolicyValueNet(
             encoder=self.encoder,
@@ -74,17 +84,27 @@ class PPOTrainer:
             ),
         )
         self.model.to(self.device)
+        if self.is_distributed:
+            if self.device.type == "cuda":
+                self.model = DDP(
+                    self.model,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=False,
+                )
+            else:
+                self.model = DDP(self.model, find_unused_parameters=False)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate)
         self.global_step = 0
         self.update_count = 0
-        self._seed_cursor = self.config.seed + 1
+        self._seed_cursor = self.config.seed + 1 + self.rank * 1_000_000
         self._wandb_module = None
         self._wandb_run = None
 
     def train(self) -> list[dict[str, float]]:
         """启动训练循环，返回每次 update 的指标。"""
         self._init_wandb_if_needed()
-        env = SelfPlayEnv(seed=self.config.seed, dealer=self.config.dealer)
+        env = SelfPlayEnv(seed=self.config.seed + self.rank, dealer=(self.config.dealer + self.rank) % 4)
         obs = env.observe()
 
         updates = max(1, self.config.total_steps // self.config.rollout_steps)
@@ -100,26 +120,36 @@ class PPOTrainer:
                 update_sec = time.time() - update_start
 
                 metrics.update(rollout_metrics)
+                metrics = self._sync_metrics(metrics)
                 metrics["timing/rollout_sec"] = float(rollout_sec)
                 metrics["timing/update_sec"] = float(update_sec)
-                metrics["timing/steps_per_sec"] = float(self.config.rollout_steps / max(rollout_sec, 1e-6))
+                local_sps = float(self.config.rollout_steps / max(rollout_sec, 1e-6))
+                metrics["timing/steps_per_sec_local"] = local_sps
+                metrics["timing/steps_per_sec"] = float(local_sps * self.world_size)
                 metrics["train/lr"] = float(self.optimizer.param_groups[0]["lr"])
                 metrics["update"] = float(update_idx)
-                metrics["global_step"] = float(self.global_step)
+                metrics["global_step"] = float(self.global_step * self.world_size)
+                metrics["ddp/world_size"] = float(self.world_size)
 
                 logs.append(metrics)
                 self.update_count += 1
                 self._log_metrics(metrics)
 
-                if self.config.log_interval > 0 and update_idx % self.config.log_interval == 0:
+                if self.is_main_process and self.config.log_interval > 0 and update_idx % self.config.log_interval == 0:
                     self._print_metrics(metrics)
 
-                if self.config.checkpoint_interval > 0 and update_idx % self.config.checkpoint_interval == 0:
+                if (
+                    self.is_main_process
+                    and self.config.checkpoint_interval > 0
+                    and update_idx % self.config.checkpoint_interval == 0
+                ):
                     self.save_checkpoint(Path(self.config.checkpoint_dir) / f"ppo_update_{update_idx}.pt")
 
-            self.save_checkpoint(Path(self.config.checkpoint_dir) / "ppo_latest.pt")
+            if self.is_main_process:
+                self.save_checkpoint(Path(self.config.checkpoint_dir) / "ppo_latest.pt")
         finally:
             self._finish_wandb()
+            self._cleanup_distributed()
         return logs
 
     def collect_rollout(
@@ -144,7 +174,7 @@ class PPOTrainer:
 
             with torch.no_grad():
                 output = self.model(model_input)
-                masked_logits = self.model.apply_action_mask(output.logits, legal_mask)
+                masked_logits = self._policy_model().apply_action_mask(output.logits, legal_mask)
                 dist = Categorical(logits=masked_logits)
                 action = dist.sample()
                 log_prob = dist.log_prob(action)
@@ -234,7 +264,7 @@ class PPOTrainer:
                         "attention_mask": mb["attention_mask"],
                     }
                 )
-                logits = self.model.apply_action_mask(output.logits, mb["legal_action_mask"])
+                logits = self._policy_model().apply_action_mask(output.logits, mb["legal_action_mask"])
                 dist = Categorical(logits=logits)
                 new_log_probs = dist.log_prob(mb["actions"])
                 entropy = dist.entropy().mean()
@@ -299,14 +329,14 @@ class PPOTrainer:
             "config": asdict(self.config),
             "global_step": self.global_step,
             "update_count": self.update_count,
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": self._policy_model().state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
         }
         torch.save(payload, p)
 
     def load_checkpoint(self, path: str | Path) -> None:
         payload = torch.load(Path(path), map_location=self.device)
-        self.model.load_state_dict(payload["model_state_dict"])
+        self._policy_model().load_state_dict(payload["model_state_dict"])
         self.optimizer.load_state_dict(payload["optimizer_state_dict"])
         self.global_step = int(payload.get("global_step", 0))
         self.update_count = int(payload.get("update_count", 0))
@@ -331,7 +361,7 @@ class PPOTrainer:
         return seed
 
     def _init_wandb_if_needed(self) -> None:
-        if not self.config.use_wandb:
+        if not self.config.use_wandb or not self.is_main_process:
             return
         import wandb
 
@@ -346,7 +376,7 @@ class PPOTrainer:
         )
 
     def _log_metrics(self, metrics: dict[str, float]) -> None:
-        if self._wandb_module is None:
+        if self._wandb_module is None or not self.is_main_process:
             return
         self._wandb_module.log(metrics, step=int(metrics["global_step"]))
 
@@ -356,6 +386,19 @@ class PPOTrainer:
         self._wandb_run.finish()
         self._wandb_run = None
         self._wandb_module = None
+
+    def _sync_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
+        if not self.is_distributed:
+            return metrics
+        synced: dict[str, float] = {}
+        for key, value in metrics.items():
+            tensor = torch.tensor(float(value), dtype=torch.float64, device=self.device)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            if key.endswith("done_count"):
+                synced[key] = float(tensor.item())
+            else:
+                synced[key] = float(tensor.item() / self.world_size)
+        return synced
 
     def _print_metrics(self, metrics: dict[str, float]) -> None:
         print(
@@ -374,7 +417,35 @@ class PPOTrainer:
         )
 
     @staticmethod
-    def _resolve_device(device: str) -> torch.device:
+    def _resolve_device(device: str, local_rank: int, is_distributed: bool) -> torch.device:
         if device == "cuda" and torch.cuda.is_available():
+            if is_distributed:
+                torch.cuda.set_device(local_rank)
             return torch.device("cuda")
         return torch.device("cpu")
+
+    def _init_distributed_if_needed(self) -> None:
+        if not self.is_distributed:
+            return
+        if dist.is_initialized():
+            return
+        backend = self.config.ddp_backend
+        if not backend:
+            backend = "nccl" if self.device.type == "cuda" else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+
+    def _cleanup_distributed(self) -> None:
+        if not self.is_distributed:
+            return
+        if dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+
+    @property
+    def is_main_process(self) -> bool:
+        return self.rank == 0
+
+    def _policy_model(self) -> TransformerPolicyValueNet:
+        if isinstance(self.model, DDP):
+            return self.model.module
+        return self.model

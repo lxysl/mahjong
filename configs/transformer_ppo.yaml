@@ -21,6 +21,7 @@ wandb_entity: null
 wandb_run_name: null
 wandb_mode: online
 wandb_tags: []
+ddp_backend: ""
 model:
   d_model: 256
   num_heads: 8
