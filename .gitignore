@@ -16,9 +16,7 @@ pip-delete-this-directory.txt
 # ===== Virtual Environments =====
 .env
 .venv
-env/
 venv/
-ENV/
 
 # ===== Testing =====
 .pytest_cache/
