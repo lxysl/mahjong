@@ -39,12 +39,14 @@
 
 ```bash
 torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29511 /Users/lxy/PycharmProjects/mahjong/train_transformer.py \
-  --device cuda --num-layers 16 --use-wandb --wandb-mode online --wandb-project mahjong-ai
+  --device cuda --num-layers 16 --num-envs-per-worker 8 \
+  --use-wandb --wandb-mode online --wandb-project mahjong-ai
 ```
 
 8 卡：
 
 ```bash
 torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29512 /Users/lxy/PycharmProjects/mahjong/train_transformer.py \
-  --device cuda --num-layers 16 --use-wandb --wandb-mode online --wandb-project mahjong-ai
+  --device cuda --num-layers 16 --num-envs-per-worker 8 \
+  --use-wandb --wandb-mode online --wandb-project mahjong-ai
 ```

@@ -1,5 +1,6 @@
 total_steps: 200000
 rollout_steps: 2048
+num_envs_per_worker: 1
 mini_batch_size: 256
 epochs: 4
 learning_rate: 0.0003

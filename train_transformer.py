@@ -13,6 +13,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="训练麻将 Transformer 策略模型")
     parser.add_argument("--total-steps", type=int, default=20000)
     parser.add_argument("--rollout-steps", type=int, default=1024)
+    parser.add_argument("--num-envs-per-worker", type=int, default=1)
     parser.add_argument("--mini-batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -45,6 +46,7 @@ def main() -> None:
     cfg = PPOConfig(
         total_steps=args.total_steps,
         rollout_steps=args.rollout_steps,
+        num_envs_per_worker=args.num_envs_per_worker,
         mini_batch_size=args.mini_batch_size,
         epochs=args.epochs,
         learning_rate=args.learning_rate,

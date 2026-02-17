@@ -9,8 +9,8 @@ import time
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
 from torch.distributions import Categorical
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -39,6 +39,9 @@ class PPOConfig:
     checkpoint_dir: str = "checkpoints"
     checkpoint_interval: int = 20
     log_interval: int = 1
+
+    # 每个 worker 的并行环境数（每卡多环境并行 rollout）
+    num_envs_per_worker: int = 1
 
     use_wandb: bool = False
     wandb_project: str = "mahjong-ai"
@@ -72,6 +75,7 @@ class PPOTrainer:
         self.is_distributed = self.world_size > 1
         self.device = self._resolve_device(self.config.device, self.local_rank, self.is_distributed)
         self._init_distributed_if_needed()
+
         self.encoder = encoder or ObservationEncoder()
         self.model = model or TransformerPolicyValueNet(
             encoder=self.encoder,
@@ -94,6 +98,7 @@ class PPOTrainer:
                 )
             else:
                 self.model = DDP(self.model, find_unused_parameters=False)
+
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate)
         self.global_step = 0
         self.update_count = 0
@@ -104,10 +109,20 @@ class PPOTrainer:
     def train(self) -> list[dict[str, float]]:
         """启动训练循环，返回每次 update 的指标。"""
         self._init_wandb_if_needed()
-        env = SelfPlayEnv(seed=self.config.seed + self.rank, dealer=(self.config.dealer + self.rank) % 4)
-        obs = env.observe()
 
-        updates = max(1, self.config.total_steps // self.config.rollout_steps)
+        num_envs = max(1, int(self.config.num_envs_per_worker))
+        envs: list[SelfPlayEnv] = []
+        obs_list: list[dict[str, Any]] = []
+        for env_idx in range(num_envs):
+            seed = self.config.seed + self.rank * 1_000_000 + env_idx
+            dealer = (self.config.dealer + self.rank + env_idx) % 4
+            env = SelfPlayEnv(seed=seed, dealer=dealer)
+            envs.append(env)
+            obs_list.append(env.observe())
+
+        steps_per_update_local = self.config.rollout_steps * num_envs
+        updates = max(1, self.config.total_steps // steps_per_update_local)
+
         logs: list[dict[str, float]] = []
         if self.is_main_process:
             print(
@@ -118,7 +133,7 @@ class PPOTrainer:
         try:
             for update_idx in range(1, updates + 1):
                 rollout_start = time.time()
-                batch, obs, rollout_metrics = self.collect_rollout(env, obs)
+                batch, obs_list, rollout_metrics = self.collect_rollout(envs, obs_list)
                 rollout_sec = time.time() - rollout_start
 
                 update_start = time.time()
@@ -127,15 +142,16 @@ class PPOTrainer:
 
                 metrics.update(rollout_metrics)
                 metrics = self._sync_metrics(metrics)
+                local_sps = float(steps_per_update_local / max(rollout_sec, 1e-6))
                 metrics["timing/rollout_sec"] = float(rollout_sec)
                 metrics["timing/update_sec"] = float(update_sec)
-                local_sps = float(self.config.rollout_steps / max(rollout_sec, 1e-6))
                 metrics["timing/steps_per_sec_local"] = local_sps
                 metrics["timing/steps_per_sec"] = float(local_sps * self.world_size)
                 metrics["train/lr"] = float(self.optimizer.param_groups[0]["lr"])
                 metrics["update"] = float(update_idx)
                 metrics["global_step"] = float(self.global_step * self.world_size)
                 metrics["ddp/world_size"] = float(self.world_size)
+                metrics["rollout/num_envs_per_worker"] = float(num_envs)
 
                 logs.append(metrics)
                 self.update_count += 1
@@ -159,84 +175,108 @@ class PPOTrainer:
         return logs
 
     def collect_rollout(
-        self, env: SelfPlayEnv, start_observation: dict[str, Any]
-    ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, float]]:
-        obs = start_observation
-        token_type_ids = []
-        tile_ids = []
-        value_ids = []
-        attention_masks = []
-        legal_action_masks = []
-        actions = []
-        log_probs = []
-        values = []
-        rewards = []
-        dones = []
+        self,
+        envs: list[SelfPlayEnv],
+        start_observations: list[dict[str, Any]],
+    ) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]], dict[str, float]]:
+        obs_list = list(start_observations)
+        num_envs = len(envs)
+        rollout_steps = self.config.rollout_steps
 
-        for _ in range(self.config.rollout_steps):
-            encoded = self.encoder.encode_single(obs)
-            model_input = self._model_input_from_encoded(encoded)
-            legal_mask = encoded["legal_action_mask"].to(self.device).unsqueeze(0)
+        token_type_ids_t = []
+        tile_ids_t = []
+        value_ids_t = []
+        attention_masks_t = []
+        legal_action_masks_t = []
+        actions_t = []
+        log_probs_t = []
+        values_t = []
+        rewards_t = []
+        dones_t = []
+
+        for _ in range(rollout_steps):
+            encoded_batch = self.encoder.encode_batch(obs_list)
+            model_input = self._model_input_from_batch(encoded_batch)
+            legal_mask = encoded_batch["legal_action_mask"].to(self.device)
 
             with torch.no_grad():
                 output = self.model(model_input)
                 masked_logits = self._policy_model().apply_action_mask(output.logits, legal_mask)
-                dist = Categorical(logits=masked_logits)
-                action = dist.sample()
-                log_prob = dist.log_prob(action)
-                value = output.value
+                dist_policy = Categorical(logits=masked_logits)
+                actions = dist_policy.sample()
+                log_probs = dist_policy.log_prob(actions)
+                values = output.value
 
-            step_result = env.step(int(action.item()))
+            step_rewards = []
+            step_dones = []
+            next_obs_list = []
+            for env_idx, env in enumerate(envs):
+                step_result = env.step(int(actions[env_idx].item()))
+                done = 1.0 if step_result.done else 0.0
+                step_rewards.append(float(step_result.reward))
+                step_dones.append(done)
+                next_obs = step_result.observation
+                if step_result.done:
+                    next_obs = env.reset(seed=self._next_seed(), dealer=(env.dealer + 1) % 4)
+                next_obs_list.append(next_obs)
 
-            token_type_ids.append(encoded["token_type_ids"])
-            tile_ids.append(encoded["tile_ids"])
-            value_ids.append(encoded["value_ids"])
-            attention_masks.append(encoded["attention_mask"])
-            legal_action_masks.append(encoded["legal_action_mask"])
-            actions.append(int(action.item()))
-            log_probs.append(float(log_prob.item()))
-            values.append(float(value.item()))
-            rewards.append(float(step_result.reward))
-            done = 1.0 if step_result.done else 0.0
-            dones.append(done)
-            self.global_step += 1
+            token_type_ids_t.append(encoded_batch["token_type_ids"])
+            tile_ids_t.append(encoded_batch["tile_ids"])
+            value_ids_t.append(encoded_batch["value_ids"])
+            attention_masks_t.append(encoded_batch["attention_mask"])
+            legal_action_masks_t.append(encoded_batch["legal_action_mask"])
+            actions_t.append(actions.detach().cpu())
+            log_probs_t.append(log_probs.detach().cpu())
+            values_t.append(values.detach().cpu())
+            rewards_t.append(torch.tensor(step_rewards, dtype=torch.float32))
+            dones_t.append(torch.tensor(step_dones, dtype=torch.float32))
+            self.global_step += num_envs
 
-            obs = step_result.observation
-            if step_result.done:
-                obs = env.reset(seed=self._next_seed(), dealer=(env.dealer + 1) % 4)
+            obs_list = next_obs_list
 
         with torch.no_grad():
-            encoded_last = self.encoder.encode_single(obs)
-            last_input = self._model_input_from_encoded(encoded_last)
-            last_value = float(self.model(last_input).value.item())
+            encoded_last = self.encoder.encode_batch(obs_list)
+            last_input = self._model_input_from_batch(encoded_last)
+            last_values = self.model(last_input).value.detach().cpu()
 
-        rewards_t = torch.tensor(rewards, dtype=torch.float32)
-        values_t = torch.tensor(values, dtype=torch.float32)
-        dones_t = torch.tensor(dones, dtype=torch.float32)
-        advantages, returns = self.compute_gae(rewards_t, values_t, dones_t, last_value)
+        rewards = torch.stack(rewards_t, dim=0)  # [T, N]
+        values = torch.stack(values_t, dim=0)  # [T, N]
+        dones = torch.stack(dones_t, dim=0)  # [T, N]
+        advantages, returns = self.compute_gae(rewards, values, dones, last_values)
+
+        token_type_ids = torch.stack(token_type_ids_t, dim=0).reshape(rollout_steps * num_envs, -1)
+        tile_ids = torch.stack(tile_ids_t, dim=0).reshape(rollout_steps * num_envs, -1)
+        value_ids = torch.stack(value_ids_t, dim=0).reshape(rollout_steps * num_envs, -1)
+        attention_mask = torch.stack(attention_masks_t, dim=0).reshape(rollout_steps * num_envs, -1)
+        legal_action_mask = torch.stack(legal_action_masks_t, dim=0).reshape(rollout_steps * num_envs, -1)
+        actions = torch.stack(actions_t, dim=0).reshape(-1)
+        old_log_probs = torch.stack(log_probs_t, dim=0).reshape(-1)
+        advantages_flat = advantages.reshape(-1)
+        returns_flat = returns.reshape(-1)
 
         batch = {
-            "token_type_ids": torch.stack(token_type_ids),
-            "tile_ids": torch.stack(tile_ids),
-            "value_ids": torch.stack(value_ids),
-            "attention_mask": torch.stack(attention_masks),
-            "legal_action_mask": torch.stack(legal_action_masks),
-            "actions": torch.tensor(actions, dtype=torch.long),
-            "old_log_probs": torch.tensor(log_probs, dtype=torch.float32),
-            "advantages": advantages,
-            "returns": returns,
+            "token_type_ids": token_type_ids,
+            "tile_ids": tile_ids,
+            "value_ids": value_ids,
+            "attention_mask": attention_mask,
+            "legal_action_mask": legal_action_mask,
+            "actions": actions.long(),
+            "old_log_probs": old_log_probs.float(),
+            "advantages": advantages_flat.float(),
+            "returns": returns_flat.float(),
         }
+
         rollout_metrics = {
-            "rollout/avg_reward": float(rewards_t.mean().item()),
-            "rollout/reward_std": float(rewards_t.std(unbiased=False).item()),
-            "rollout/done_count": float(dones_t.sum().item()),
-            "rollout/done_rate": float(dones_t.mean().item()),
-            "rollout/avg_value_pred": float(values_t.mean().item()),
+            "rollout/avg_reward": float(rewards.mean().item()),
+            "rollout/reward_std": float(rewards.std(unbiased=False).item()),
+            "rollout/done_count": float(dones.sum().item()),
+            "rollout/done_rate": float(dones.mean().item()),
+            "rollout/avg_value_pred": float(values.mean().item()),
             "rollout/avg_advantage": float(advantages.mean().item()),
             "rollout/avg_return": float(returns.mean().item()),
             "rollout/illegal_action_count": 0.0,
         }
-        return batch, obs, rollout_metrics
+        return batch, obs_list, rollout_metrics
 
     def update(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
         n = batch["actions"].shape[0]
@@ -271,9 +311,9 @@ class PPOTrainer:
                     }
                 )
                 logits = self._policy_model().apply_action_mask(output.logits, mb["legal_action_mask"])
-                dist = Categorical(logits=logits)
-                new_log_probs = dist.log_prob(mb["actions"])
-                entropy = dist.entropy().mean()
+                dist_policy = Categorical(logits=logits)
+                new_log_probs = dist_policy.log_prob(mb["actions"])
+                entropy = dist_policy.entropy().mean()
 
                 ratio = (new_log_probs - mb["old_log_probs"]).exp()
                 surr1 = ratio * mb["advantages"]
@@ -293,9 +333,7 @@ class PPOTrainer:
                     approx_kl = (mb["old_log_probs"] - new_log_probs).mean().item()
                     clip_fraction = ((ratio - 1.0).abs() > self.config.clip_ratio).float().mean().item()
                     var_y = torch.var(mb["returns"])
-                    explained_var = 1.0 - (
-                        torch.var(mb["returns"] - output.value) / (var_y + 1e-8)
-                    ).item()
+                    explained_var = 1.0 - (torch.var(mb["returns"] - output.value) / (var_y + 1e-8)).item()
                 metrics["loss"] += float(loss.item())
                 metrics["policy_loss"] += float(policy_loss.item())
                 metrics["value_loss"] += float(value_loss.item())
@@ -311,18 +349,22 @@ class PPOTrainer:
         return metrics
 
     def compute_gae(
-        self, rewards: torch.Tensor, values: torch.Tensor, dones: torch.Tensor, last_value: float
+        self,
+        rewards: torch.Tensor,
+        values: torch.Tensor,
+        dones: torch.Tensor,
+        last_values: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """向量化 GAE，输入形状为 [T, N]。"""
         advantages = torch.zeros_like(rewards)
-        gae = 0.0
+        gae = torch.zeros_like(last_values)
         for t in reversed(range(rewards.shape[0])):
             if t == rewards.shape[0] - 1:
-                next_value = last_value
-                next_non_terminal = 1.0 - dones[t].item()
+                next_values = last_values
             else:
-                next_value = values[t + 1].item()
-                next_non_terminal = 1.0 - dones[t].item()
-            delta = rewards[t].item() + self.config.gamma * next_value * next_non_terminal - values[t].item()
+                next_values = values[t + 1]
+            next_non_terminal = 1.0 - dones[t]
+            delta = rewards[t] + self.config.gamma * next_values * next_non_terminal - values[t]
             gae = delta + self.config.gamma * self.config.gae_lambda * next_non_terminal * gae
             advantages[t] = gae
         returns = advantages + values
@@ -347,12 +389,12 @@ class PPOTrainer:
         self.global_step = int(payload.get("global_step", 0))
         self.update_count = int(payload.get("update_count", 0))
 
-    def _model_input_from_encoded(self, encoded: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def _model_input_from_batch(self, encoded: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {
-            "token_type_ids": encoded["token_type_ids"].to(self.device).unsqueeze(0),
-            "tile_ids": encoded["tile_ids"].to(self.device).unsqueeze(0),
-            "value_ids": encoded["value_ids"].to(self.device).unsqueeze(0),
-            "attention_mask": encoded["attention_mask"].to(self.device).unsqueeze(0),
+            "token_type_ids": encoded["token_type_ids"].to(self.device),
+            "tile_ids": encoded["tile_ids"].to(self.device),
+            "value_ids": encoded["value_ids"].to(self.device),
+            "attention_mask": encoded["attention_mask"].to(self.device),
         }
 
     def _batch_to_device(self, batch: dict[str, torch.Tensor], idx: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -456,3 +498,4 @@ class PPOTrainer:
         if isinstance(self.model, DDP):
             return self.model.module
         return self.model
+
