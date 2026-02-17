@@ -119,6 +119,7 @@ class PPOTrainer:
             env = SelfPlayEnv(seed=seed, dealer=dealer)
             envs.append(env)
             obs_list.append(env.observe())
+        pending_rewards_by_env = [self._zero_pending_rewards(env.state.num_players) for env in envs]
 
         steps_per_update_local = self.config.rollout_steps * num_envs
         updates = max(1, self.config.total_steps // steps_per_update_local)
@@ -133,7 +134,9 @@ class PPOTrainer:
         try:
             for update_idx in range(1, updates + 1):
                 rollout_start = time.time()
-                batch, obs_list, rollout_metrics = self.collect_rollout(envs, obs_list)
+                batch, obs_list, rollout_metrics, pending_rewards_by_env = self.collect_rollout(
+                    envs, obs_list, pending_rewards_by_env
+                )
                 rollout_sec = time.time() - rollout_start
 
                 update_start = time.time()
@@ -178,10 +181,15 @@ class PPOTrainer:
         self,
         envs: list[SelfPlayEnv],
         start_observations: list[dict[str, Any]],
-    ) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]], dict[str, float]]:
+        pending_rewards_by_env: list[dict[int, float]],
+    ) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]], dict[str, float], list[dict[int, float]]]:
         obs_list = list(start_observations)
         num_envs = len(envs)
         rollout_steps = self.config.rollout_steps
+        pending_rewards = [dict(seat_rewards) for seat_rewards in pending_rewards_by_env]
+        last_transition_step_by_env: list[dict[int, int | None]] = [
+            {seat: None for seat in seat_rewards} for seat_rewards in pending_rewards
+        ]
 
         token_type_ids_t = []
         tile_ids_t = []
@@ -194,7 +202,7 @@ class PPOTrainer:
         rewards_t = []
         dones_t = []
 
-        for _ in range(rollout_steps):
+        for step_idx in range(rollout_steps):
             encoded_batch = self.encoder.encode_batch(obs_list)
             model_input = self._model_input_from_batch(encoded_batch)
             legal_mask = encoded_batch["legal_action_mask"].to(self.device)
@@ -211,12 +219,28 @@ class PPOTrainer:
             step_dones = []
             next_obs_list = []
             for env_idx, env in enumerate(envs):
+                actor = env.state.current_player
                 step_result = env.step(int(actions[env_idx].item()))
+                reward_delta = step_result.reward_delta or {actor: float(step_result.reward)}
+                for seat, delta in reward_delta.items():
+                    pending_rewards[env_idx][seat] = pending_rewards[env_idx].get(seat, 0.0) + float(delta)
+                actor_reward = pending_rewards[env_idx].get(actor, 0.0)
+                pending_rewards[env_idx][actor] = 0.0
+                last_transition_step_by_env[env_idx][actor] = step_idx
+
                 done = 1.0 if step_result.done else 0.0
-                step_rewards.append(float(step_result.reward))
+                step_rewards.append(float(actor_reward))
                 step_dones.append(done)
                 next_obs = step_result.observation
                 if step_result.done:
+                    self._flush_pending_rewards_to_last_transitions(
+                        env_idx=env_idx,
+                        pending_rewards=pending_rewards,
+                        last_transition_step_by_env=last_transition_step_by_env,
+                        rewards_t=rewards_t,
+                    )
+                    pending_rewards[env_idx] = self._zero_pending_rewards(env.state.num_players)
+                    last_transition_step_by_env[env_idx] = {seat: None for seat in pending_rewards[env_idx]}
                     next_obs = env.reset(seed=self._next_seed(), dealer=(env.dealer + 1) % 4)
                 next_obs_list.append(next_obs)
 
@@ -233,6 +257,14 @@ class PPOTrainer:
             self.global_step += num_envs
 
             obs_list = next_obs_list
+
+        for env_idx in range(num_envs):
+            self._flush_pending_rewards_to_last_transitions(
+                env_idx=env_idx,
+                pending_rewards=pending_rewards,
+                last_transition_step_by_env=last_transition_step_by_env,
+                rewards_t=rewards_t,
+            )
 
         with torch.no_grad():
             encoded_last = self.encoder.encode_batch(obs_list)
@@ -276,7 +308,31 @@ class PPOTrainer:
             "rollout/avg_return": float(returns.mean().item()),
             "rollout/illegal_action_count": 0.0,
         }
-        return batch, obs_list, rollout_metrics
+        return batch, obs_list, rollout_metrics, pending_rewards
+
+    @staticmethod
+    def _zero_pending_rewards(num_players: int) -> dict[int, float]:
+        return {seat: 0.0 for seat in range(num_players)}
+
+    @staticmethod
+    def _flush_pending_rewards_to_last_transitions(
+        env_idx: int,
+        pending_rewards: list[dict[int, float]],
+        last_transition_step_by_env: list[dict[int, int | None]],
+        rewards_t: list[torch.Tensor],
+    ) -> None:
+        if not rewards_t:
+            return
+        pending = pending_rewards[env_idx]
+        last_steps = last_transition_step_by_env[env_idx]
+        for seat, remain in pending.items():
+            if abs(remain) < 1e-12:
+                continue
+            last_step = last_steps.get(seat)
+            if last_step is None:
+                continue
+            rewards_t[last_step][env_idx] += float(remain)
+            pending[seat] = 0.0
 
     def update(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
         n = batch["actions"].shape[0]
@@ -498,4 +554,3 @@ class PPOTrainer:
         if isinstance(self.model, DDP):
             return self.model.module
         return self.model
-

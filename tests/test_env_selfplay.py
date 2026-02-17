@@ -53,5 +53,9 @@ def test_response_hu_should_settle_immediately_for_claiming_player():
     result = env.step(Action("hu"))
     assert result.done is True
     assert result.reward == 1
+    assert result.reward_delta[1] == 1
+    assert result.reward_delta[0] == -1
+    assert result.reward_delta[2] == -1
+    assert result.reward_delta[3] == -1
     assert result.info["winner"] == 1
     assert result.info["win_mode"] == "dian_hu"

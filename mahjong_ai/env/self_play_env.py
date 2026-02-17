@@ -27,6 +27,7 @@ class StepResult:
     reward: float
     done: bool
     info: dict[str, Any]
+    reward_delta: dict[int, float]
 
 
 class SelfPlayEnv:
@@ -99,7 +100,7 @@ class SelfPlayEnv:
 
     def step(self, action: Action | int) -> StepResult:
         if self.state.phase == "terminal":
-            return StepResult(self.observe(), reward=0.0, done=True, info={"reason": "terminal"})
+            return StepResult(self.observe(), reward=0.0, done=True, info={"reason": "terminal"}, reward_delta={})
 
         if self.state.phase == "draw":
             draw_for_current_player(self.state)
@@ -126,8 +127,15 @@ class SelfPlayEnv:
             "win_mode": self.state.win_mode,
             "win_type": self.state.win_type,
             "rewards": dict(self.state.rewards),
+            "reward_delta": dict(reward_delta),
         }
-        return StepResult(self.observe(), reward=reward_delta.get(actor, 0.0), done=done, info=info)
+        return StepResult(
+            self.observe(),
+            reward=reward_delta.get(actor, 0.0),
+            done=done,
+            info=info,
+            reward_delta=reward_delta,
+        )
 
     def _apply_response_action(self, seat: int, action: Action) -> None:
         state = self.state
