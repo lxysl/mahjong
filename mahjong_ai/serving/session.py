@@ -10,7 +10,7 @@ from mahjong_ai.env.actions import Action
 from mahjong_ai.env.game_state import GameState
 from mahjong_ai.env.transition import apply_resolved_reaction, apply_turn_action
 from mahjong_ai.rules.laizi import indicator_to_laizi
-from mahjong_ai.rules.scoring import RewardConfig
+from mahjong_ai.rules.scoring import RewardConfig, evaluate_hand_progress
 from mahjong_ai.rules.tiles import NUM_TILE_TYPES, make_counts
 from mahjong_ai.serving.event_parser import normalize_event
 from mahjong_ai.serving.recommend import recommend_actions
@@ -45,9 +45,17 @@ class GameSession:
         state.hands = [[0] * NUM_TILE_TYPES for _ in range(state.num_players)]
         state.melds = [[] for _ in range(state.num_players)]
         state.discards = [[] for _ in range(state.num_players)]
-        state.rewards = {seat: 0 for seat in range(state.num_players)}
+        state.rewards = {seat: 0.0 for seat in range(state.num_players)}
         for seat, tiles in initial_hands.items():
             state.hands[seat] = make_counts(tiles)
+        state.progress_snapshot = {seat: None for seat in range(state.num_players)}
+        state.tenpai_enter_reward_used = {seat: False for seat in range(state.num_players)}
+        for seat in range(state.num_players):
+            if sum(state.hands[seat]) % 3 != 1:
+                continue
+            progress = evaluate_hand_progress(list(state.hands[seat]), laizi_idx=state.laizi_tile, enable_special=True)
+            state.progress_snapshot[seat] = (progress.tenpai, progress.outs)
+            state.tenpai_enter_reward_used[seat] = progress.tenpai
         self.state = state
         self._snapshots = []
 
@@ -129,4 +137,3 @@ class GameSession:
         if not self._snapshots:
             raise ValueError("没有可撤销事件")
         self.state = self._snapshots.pop()
-

@@ -24,7 +24,7 @@ from mahjong_ai.rules.scoring import RewardConfig
 @dataclass
 class StepResult:
     observation: dict[str, Any]
-    reward: int
+    reward: float
     done: bool
     info: dict[str, Any]
 
@@ -99,7 +99,7 @@ class SelfPlayEnv:
 
     def step(self, action: Action | int) -> StepResult:
         if self.state.phase == "terminal":
-            return StepResult(self.observe(), reward=0, done=True, info={"reason": "terminal"})
+            return StepResult(self.observe(), reward=0.0, done=True, info={"reason": "terminal"})
 
         if self.state.phase == "draw":
             draw_for_current_player(self.state)
@@ -127,7 +127,7 @@ class SelfPlayEnv:
             "win_type": self.state.win_type,
             "rewards": dict(self.state.rewards),
         }
-        return StepResult(self.observe(), reward=reward_delta.get(actor, 0), done=done, info=info)
+        return StepResult(self.observe(), reward=reward_delta.get(actor, 0.0), done=done, info=info)
 
     def _apply_response_action(self, seat: int, action: Action) -> None:
         state = self.state
@@ -136,6 +136,9 @@ class SelfPlayEnv:
 
         if action.kind != "pass":
             state.response_claims[seat] = action
+            if self._is_immediate_resolvable_claim(action):
+                apply_resolved_reaction(state, seat, action, config=self.reward_config)
+                return
 
         state.response_index += 1
         if state.response_index < len(state.response_order):
@@ -208,10 +211,21 @@ class SelfPlayEnv:
             return {a for a in actions if a.kind in {"pass", "chi"}}
         return actions
 
-    def _consume_reward_delta(self) -> dict[int, int]:
-        delta: dict[int, int] = {}
+    def _is_immediate_resolvable_claim(self, action: Action) -> bool:
+        """当前座位声明后是否可立即结算（按顺序响应，后续座位优先级更低）。"""
+        stage = self.state.response_stage
+        if stage == "hu":
+            return action.kind == "hu"
+        if stage == "peng_gang":
+            return action.kind in {"peng", "ming_gang"}
+        if stage == "chi":
+            return action.kind == "chi"
+        return False
+
+    def _consume_reward_delta(self) -> dict[int, float]:
+        delta: dict[int, float] = {}
         for seat, value in self.state.rewards.items():
-            prev = self._last_rewards.get(seat, 0)
+            prev = self._last_rewards.get(seat, 0.0)
             delta[seat] = value - prev
         self._last_rewards = dict(self.state.rewards)
         return delta
@@ -219,4 +233,3 @@ class SelfPlayEnv:
     @property
     def action_space_size(self) -> int:
         return action_space_size()
-

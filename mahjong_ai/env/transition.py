@@ -8,7 +8,14 @@ from mahjong_ai.env.actions import Action
 from mahjong_ai.env.game_state import GameState, Meld, PendingDiscard
 from mahjong_ai.rules.hand_checker import check_win
 from mahjong_ai.rules.laizi import indicator_to_laizi
-from mahjong_ai.rules.scoring import RewardConfig, immediate_gang_reward, terminal_rewards
+from mahjong_ai.rules.scoring import (
+    HandProgress,
+    RewardConfig,
+    dense_progress_reward,
+    evaluate_hand_progress,
+    immediate_gang_reward,
+    terminal_rewards,
+)
 from mahjong_ai.rules.tiles import NUM_TILE_TYPES, is_suited, tile_rank
 
 
@@ -47,6 +54,7 @@ def initialize_round(seed: int | None = None, dealer: int = 0) -> GameState:
     state.phase = "action"
     state.after_gang_draw = False
     state.pending_discard = None
+    _initialize_progress_snapshots(state)
     return state
 
 
@@ -91,7 +99,23 @@ def apply_turn_action(
     if action.kind == "discard":
         if action.tile is None or hand[action.tile] <= 0:
             raise ValueError("打牌非法：手牌不足")
+        progress_before = _get_progress_snapshot(state, seat)
         hand[action.tile] -= 1
+        progress_after = evaluate_hand_progress(list(hand), laizi_idx=laizi_idx, enable_special=True)
+        allow_tenpai_enter = not state.tenpai_enter_reward_used.get(seat, False)
+        if progress_before is not None:
+            state.rewards[seat] += dense_progress_reward(
+                progress_before,
+                progress_after,
+                cfg,
+                allow_tenpai_enter=allow_tenpai_enter,
+            )
+            if allow_tenpai_enter and (not progress_before.tenpai) and progress_after.tenpai:
+                state.tenpai_enter_reward_used[seat] = True
+        elif progress_after.tenpai:
+            # 无历史快照时不追溯发奖励，但标记首次听牌已占用，避免后续重复。
+            state.tenpai_enter_reward_used[seat] = True
+        _set_progress_snapshot(state, seat, progress_after)
         state.discards[seat].append(action.tile)
         state.pending_discard = PendingDiscard(discarder=seat, tile=action.tile)
         state.phase = "response"
@@ -291,6 +315,40 @@ def _apply_chi(hand: list[int], chi_start: int, discarded_tile: int, laizi_idx: 
         _remove_tiles_with_laizi(hand, t, need=1, laizi_idx=laizi_idx)
 
 
+def _initialize_progress_snapshots(state: GameState) -> None:
+    """初始化每个座位的手牌进度快照，用于增量奖励差分。"""
+    laizi_idx = state.laizi_tile
+    state.progress_snapshot = {seat: None for seat in range(state.num_players)}
+    state.tenpai_enter_reward_used = {seat: False for seat in range(state.num_players)}
+
+    for seat in range(state.num_players):
+        hand = state.hands[seat]
+
+        # 开局庄家 14 张，快照应对应“上一次落地的 13 张”状态。
+        if seat == state.dealer and state.last_drawn_tile is not None and hand[state.last_drawn_tile] > 0:
+            hand[state.last_drawn_tile] -= 1
+            progress = evaluate_hand_progress(list(hand), laizi_idx=laizi_idx, enable_special=True)
+            hand[state.last_drawn_tile] += 1
+        else:
+            progress = evaluate_hand_progress(list(hand), laizi_idx=laizi_idx, enable_special=True)
+
+        _set_progress_snapshot(state, seat, progress)
+        if progress.tenpai:
+            state.tenpai_enter_reward_used[seat] = True
+
+
+def _get_progress_snapshot(state: GameState, seat: int) -> HandProgress | None:
+    snapshot = state.progress_snapshot.get(seat)
+    if snapshot is None:
+        return None
+    tenpai, outs = snapshot
+    return HandProgress(tenpai=tenpai, outs=outs)
+
+
+def _set_progress_snapshot(state: GameState, seat: int, progress: HandProgress) -> None:
+    state.progress_snapshot[seat] = (progress.tenpai, progress.outs)
+
+
 def _remove_tiles_with_laizi(hand: list[int], tile: int, need: int, laizi_idx: int | None) -> None:
     natural = hand[tile]
     if laizi_idx is not None and tile == laizi_idx:
@@ -313,7 +371,7 @@ def _find_peng_meld(melds: list[Meld], tile: int) -> int:
     return -1
 
 
-def _accumulate_rewards(state: GameState, delta: dict[int, int]) -> None:
+def _accumulate_rewards(state: GameState, delta: dict[int, float]) -> None:
     for seat, value in delta.items():
         state.rewards[seat] = state.rewards.get(seat, 0) + value
 

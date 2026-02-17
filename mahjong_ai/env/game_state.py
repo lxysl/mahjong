@@ -54,7 +54,13 @@ class GameState:
     win_type: str | None = None
     gang_shang_hua: bool = False
 
-    rewards: dict[int, int] = field(default_factory=lambda: {0: 0, 1: 0, 2: 0, 3: 0})
+    # 用于增量稠密奖励：记录“上一次落地手牌”的听牌进度与首次听牌奖励发放状态
+    progress_snapshot: dict[int, tuple[bool, int] | None] = field(
+        default_factory=lambda: {0: None, 1: None, 2: None, 3: None}
+    )
+    tenpai_enter_reward_used: dict[int, bool] = field(default_factory=lambda: {0: False, 1: False, 2: False, 3: False})
+
+    rewards: dict[int, float] = field(default_factory=lambda: {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0})
     history: list[dict[str, Any]] = field(default_factory=list)
 
     def wall_remaining(self) -> int:

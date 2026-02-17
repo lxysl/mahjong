@@ -13,7 +13,7 @@ from mahjong_ai.env.self_play_env import SelfPlayEnv
 class EpisodeResult:
     steps: int
     winner: int | None
-    rewards: dict[int, int]
+    rewards: dict[int, float]
     transitions: list[dict[str, Any]]
 
 
@@ -51,4 +51,3 @@ def run_episode(env: SelfPlayEnv, policies: dict[int, Policy], max_steps: int = 
         rewards=dict(env.state.rewards),
         transitions=transitions,
     )
-
