@@ -109,6 +109,12 @@ class PPOTrainer:
 
         updates = max(1, self.config.total_steps // self.config.rollout_steps)
         logs: list[dict[str, float]] = []
+        if self.is_main_process:
+            print(
+                f"training start: updates={updates} rollout_steps={self.config.rollout_steps} "
+                f"world_size={self.world_size} device={self.device}",
+                flush=True,
+            )
         try:
             for update_idx in range(1, updates + 1):
                 rollout_start = time.time()
@@ -413,7 +419,8 @@ class PPOTrainer:
                 kl=metrics["approx_kl"],
                 reward=metrics["rollout/avg_reward"],
                 sps=metrics["timing/steps_per_sec"],
-            )
+            ),
+            flush=True,
         )
 
     @staticmethod

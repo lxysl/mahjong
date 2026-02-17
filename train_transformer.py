@@ -71,14 +71,15 @@ def main() -> None:
     logs = trainer.train()
     if logs and is_main:
         last = logs[-1]
-        print("training finished")
+        print("training finished", flush=True)
         print(
             f"update={int(last['update'])} step={int(last['global_step'])} "
-            f"loss={last['loss']:.4f} policy={last['policy_loss']:.4f} value={last['value_loss']:.4f}"
+            f"loss={last['loss']:.4f} policy={last['policy_loss']:.4f} value={last['value_loss']:.4f}",
+            flush=True,
         )
     latest_ckpt = Path(cfg.checkpoint_dir) / "ppo_latest.pt"
     if is_main:
-        print(f"latest checkpoint: {latest_ckpt}")
+        print(f"latest checkpoint: {latest_ckpt}", flush=True)
 
 
 if __name__ == "__main__":
